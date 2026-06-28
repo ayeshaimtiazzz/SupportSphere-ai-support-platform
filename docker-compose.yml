@@ -1,0 +1,167 @@
+version: "3.9"
+
+services:
+  # ─────────────────────────────────────────
+  # DATABASE
+  # ─────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg15          # official image with pgvector pre-installed
+    container_name: support_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: support_user
+      POSTGRES_PASSWORD: support_pass
+      POSTGRES_DB: support_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql   # runs on first start
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support_user -d support_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────
+  # CACHE / RATE LIMITER
+  # ─────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: support_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes   # persistence enabled
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────
+  # KAFKA STACK
+  # ─────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: support_zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: support_kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"       # for host machine access (our Python scripts)
+      - "29092:29092"     # for inter-container access
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # we create topics manually for control
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # Kafka topic initializer — runs once, creates our topics, then exits
+  kafka-init:
+      image: confluentinc/cp-kafka:7.5.0
+      container_name: support_kafka_init
+      depends_on:
+        kafka:
+          condition: service_healthy
+      command: >
+        bash -c "
+          echo 'Waiting for Kafka to be ready...' &&
+          sleep 10 &&
+          kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic conversation_events &&
+          kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 1 --topic analytics_aggregations &&
+          echo 'Topics created:' &&
+          kafka-topics --list --bootstrap-server kafka:29092
+        "
+
+  # ─────────────────────────────────────────
+  # BACKEND (FastAPI) — uncomment after Phase 2
+  # ─────────────────────────────────────────
+  # backend:
+  #   build: ./backend
+  #   container_name: support_backend
+  #   restart: unless-stopped
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_healthy
+  #   ports:
+  #     - "8000:8000"
+  #   env_file: .env
+  #   volumes:
+  #     - ./backend:/app
+
+  # ─────────────────────────────────────────
+  # MONITORING
+  # ─────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: support_prometheus
+    restart: unless-stopped
+    ports:
+      - "9095:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: support_grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"     # 3000 will be used by React, so Grafana runs on 3001
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards
+
+# ─────────────────────────────────────────
+# NAMED VOLUMES (data persists between restarts)
+# ─────────────────────────────────────────
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
+  prometheus_data:
+  grafana_data:
