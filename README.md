@@ -164,7 +164,7 @@ Node 8: resolve_node
 | Hardware | NVIDIA T4 16GB (Google Colab free tier) |
 | Precision | fp16 (T4 does not support bf16) |
 | Training time | ~2.5 hours |
-| HuggingFace | [your-username/supportsphere-mistral-support](https://huggingface.co) |
+| HuggingFace | [ayeshaimtiazzz/supportsphere-mistral-support](https://huggingface.co) |
 
 ---
 
